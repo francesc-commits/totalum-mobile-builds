@@ -1,0 +1,117 @@
+# Totalum mobile builds on your own Codemagic account.
+# Totalum starts these workflows through the Codemagic API when you add your Codemagic API token to a project's
+# Mobile apps section. Each build downloads the project's saved source (TOTALUM_SOURCE_URL, a short-lived link) and
+# builds it; nothing else from this repository is used. Do not edit the app's workflows in Codemagic: Totalum starts
+# them by name.
+definitions:
+  env: &env
+    node: 22
+    java: 21
+  ios-env: &iosenv
+    <<: *env
+    xcode: latest
+  source: &source
+    name: Project source
+    script: |
+      if [ -z "${TOTALUM_SOURCE_URL:-}" ]; then
+        echo "No saved version of the project to build yet: send a prompt in Totalum first, then build again." >&2
+        exit 1
+      fi
+      find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+      curl -fsSL "$TOTALUM_SOURCE_URL" | tar -xz
+  app-name: &appname
+    name: App name
+    script: |
+      # no app name set in Totalum: the store listing's title (English first), else the app's own name
+      # (the script goes to a file first: macOS bash 3.2 cannot parse a quoted heredoc inside $(…))
+      if [ -n "${MOBILE_APP_NAME_IS_DEFAULT:-}" ]; then
+        cat > "${TMPDIR:-/tmp}/app-name.cjs" <<'JS'
+      const fs = require('fs');
+      const read = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
+      const field = (f, k) => { try { const v = JSON.parse(read(f))[k]; return typeof v === 'string' ? v.trim() : ''; } catch { return ''; } };
+      let locales = [];
+      try { locales = fs.readdirSync('store/listing'); } catch {}
+      locales.sort((a, b) => Number(b.startsWith('en')) - Number(a.startsWith('en')));
+      const listed = locales.flatMap((l) => [field(`store/listing/${l}/google-play.json`, 'title'), field(`store/listing/${l}/app-store.json`, 'name')]);
+      const site = (/\bname:\s*(['"`])(.+?)\1/.exec(read('src/lib/site.ts'))?.[2] ?? '').trim();
+      const name = [...listed, site === 'New Totalum app' ? '' : site].find(Boolean) ?? '';
+      process.stdout.write(name.slice(0, 30));
+      JS
+        NAME=$(node "${TMPDIR:-/tmp}/app-name.cjs")
+        if [ -n "$NAME" ]; then echo "MOBILE_APP_NAME=$NAME" >> "$CM_ENV"; fi
+      fi
+  install: &install
+    name: Install
+    script: |
+      # stop at the first failure, so its error is the build's error
+      set -e
+      npm ci --no-audit --no-fund
+      grep -q '"@capacitor/cli"' package.json || npm run mobile:enable
+workflows:
+  totalum-android:
+    name: Totalum Android build
+    instance_type: linux_x2
+    max_build_duration: 30
+    environment: *env
+    scripts:
+      - *source
+      - *appname
+      - *install
+      - name: Build
+        script: npm run mobile:setup && npm run build:mobile
+    artifacts:
+      - mobile-artifacts/*.apk
+      - mobile-artifacts/*.aab
+  totalum-ios-simulator:
+    name: Totalum iOS simulator build
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+    environment:
+      <<: *iosenv
+      vars:
+        MOBILE_TARGET: ios
+    scripts:
+      - *source
+      - *appname
+      - *install
+      - name: Build
+        script: MOBILE_ARTIFACT=simulator-app npm run mobile:setup && MOBILE_ARTIFACT=simulator-app npm run build:mobile
+    artifacts:
+      - mobile-artifacts/*.zip
+  totalum-ios-ipa:
+    name: Totalum iOS signed ipa
+    instance_type: mac_mini_m2
+    max_build_duration: 45
+    environment:
+      <<: *iosenv
+      vars:
+        MOBILE_TARGET: ios
+    scripts:
+      - *source
+      - *appname
+      - *install
+      - name: Prepare the Xcode project
+        script: MOBILE_ARTIFACT=ipa npm run mobile:setup && MOBILE_ARTIFACT=ipa npm run build:mobile
+      - name: Signing files (App Store distribution certificate + profile, created when missing)
+        script: |
+          keychain initialize
+          app-store-connect fetch-signing-files "$TOTALUM_BUNDLE_ID" --type IOS_APP_STORE --create \
+            --certificate-key @env:CERTIFICATE_PRIVATE_KEY
+          keychain add-certificates
+          xcode-project use-profiles --project ios/App/App.xcodeproj
+      - name: Build ipa
+        script: |
+          xcode-project build-ipa --project ios/App/App.xcodeproj --scheme App
+          mkdir -p mobile-artifacts && cp build/ios/ipa/*.ipa mobile-artifacts/
+    artifacts:
+      - mobile-artifacts/*.ipa
+  totalum-testflight-upload:
+    name: Totalum TestFlight upload
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+    environment: *iosenv
+    scripts:
+      - name: Fetch the ipa
+        script: curl -fsSL "$TOTALUM_IPA_URL" -o app.ipa
+      - name: Upload to TestFlight
+        script: app-store-connect publish --path app.ipa
